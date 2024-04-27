@@ -124,3 +124,7 @@ profile_gpt2cu: profile_gpt2.cu
 
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu test_gpt2fp32cu
+
+clang-tidy:
+	clang-tidy -header-filter=.* train_gpt2.c
+	#train_gpt2.cu train_gpt2fp32.cu 
