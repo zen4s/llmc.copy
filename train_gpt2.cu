@@ -337,10 +337,10 @@ __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY
 __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
     // todo - is this stochastic rounding *too good*? can we cut any corners?
     unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    unsigned int threshold = random & 0xFFFF;
+    unsigned int threshold = random & 0xFFFFu;
     unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
+    unsigned int rounded_bits = float_bits & 0x0000FFFFu;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFFu) : (float_bits  & ~0xFFFFu);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
 }
 __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
@@ -348,6 +348,81 @@ __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigne
 }
 __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)
+}
+
+// ----------------------------------------------------------------------------
+//  bit-fiddling to reconstruct master weights from BF16 and missing bits
+// handling bf16 is _almost_ just storing the 16 bits of significant that get
+// truncated when going from float -> bf16; except we do stochastic rounding.
+// if we end up rounding towards zero, we could just keep the bits, but if we
+// round away from zero, there is a chance that the other bits of the bf16 no
+// longer correspond to the bits in the original float. So we have to reserve
+// one bit to remember whether we rounded up or down, for an effective master
+// weight precision of fp31. That should still be more than sufficient.
+
+// Result of splitting a float into a stochastically-rounded bfloat16 and
+// additional reconstruction bits
+struct SplitFloatResult {
+    nv_bfloat16 b_float;
+    unsigned short bits;
+};
+
+// UB-free bit-level conversions. A C++17 version for C++20 std::bit_cast
+template<class T, class S>
+__host__ __device__ T bit_cast(S v) {
+    T dest;
+    static_assert(sizeof(v) == sizeof(dest), "Size mismatch.");
+    memcpy(&dest, &v, sizeof(v));
+    return dest;
+}
+
+// Splits a float into a bfloat16 and the remaining significant bits
+ __device__ SplitFloatResult split_float(float value, unsigned short threshold) {
+    unsigned int float_bits = bit_cast<unsigned int>(value);
+    // IEEE 754: float: S E(8) M (23)    bfloat: same, but significant 23-16 = 7 bits
+    // ideally, we'd just store the cut-off 16 bits, but that doesn't work if rounding
+    // is involved.
+    unsigned int rounded_bits = float_bits & 0x0000FFFFu;
+    if(rounded_bits > threshold) {
+        SplitFloatResult result;
+        result.b_float = __float2bfloat16_rn(bit_cast<float>(float_bits | 0xFFFFu));
+        result.bits = rounded_bits & (~1u) | 1u;
+        return result;
+    } else {
+        // truncation is easy
+        SplitFloatResult result;
+        result.b_float = bit_cast<__nv_bfloat16>((unsigned short)(float_bits >> 16u));
+        result.bits = rounded_bits & (~1u);
+        return result;
+    }
+}
+
+// Reassembles a float from the bfloat16 part and the missing mantissa
+__device__ float assemble_float(nv_bfloat16 b_float, unsigned short bits) {
+    constexpr const unsigned short BF16_SIGN_MASK        = 0b1'00000000'0000000u;
+    constexpr const unsigned short BF16_EXPONENT_MASK    = 0b0'11111111'0000000u;
+    constexpr const unsigned short BF16_SIGNIFICANT_MASK = 0b0'00000000'1111111u;
+    unsigned short bf = bit_cast<unsigned short>(b_float);
+    if(bits & 1u) {
+        // if we rounded away from zero, we need to undo these changes.
+        // first, check if the significant (7 bits) of bf16 is zero
+        if((bf & BF16_SIGNIFICANT_MASK) == 0) {
+            // significant overflowed, need to decrement the exponent
+            unsigned short exponent = (bf & BF16_EXPONENT_MASK) >> 7u;
+            if(exponent == 0) {
+                // zero, cannot be reached if we round away from zero
+                __builtin_unreachable();
+            }
+            // decrement the exponent and set significant to all-ones
+            bf = bf & BF16_SIGN_MASK | ((exponent-1u) << 7u) | BF16_SIGNIFICANT_MASK;
+        } else {
+            // significant was incremented, decrement
+            unsigned short significant = bf & BF16_SIGNIFICANT_MASK;
+            bf = bf & (BF16_SIGN_MASK | BF16_EXPONENT_MASK) | (significant - 1);
+        }
+    }
+    unsigned int result = (bits & (~1u)) | (bf << 16u);
+    return bit_cast<float>(result);
 }
 
 // ----------------------------------------------------------------------------
@@ -1152,13 +1227,11 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(Tp* params_memory, unsigned short* mantissas, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_parameters) { return; }  // guard
-
-    // get the gradient, m, and v for this parameter
+    if (idx >= num_parameters) return;  // guard
     float grad = grad_scale * (float)grads_memory[idx];
     float m = m_memory[idx];
     float v = v_memory[idx];
@@ -1171,17 +1244,32 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat
     // fetch the old value of this parameter as a float, from either source
-    float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
-    // update this parameter
+    float old_param;
+    if (mantissas != NULL) {
+        old_param = assemble_float(params_memory[idx], mantissas[idx]);
+    } else {
+        old_param = (float)params_memory[idx];
+    }
+    // update this parameter in 32-bit precision
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
+
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
     // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    stochastic_rounding(param, &params_memory[idx], random);
-    // write the full, float version of the param into our master copy, if we maintain one
-    // this will be used in the next update
-    if (master_params_memory != NULL) { master_params_memory[idx] = param; }
+
+    // If we keep master parameter "copies", make sure to store the missing bits in the 'mantissas' array,
+    // otherwise we can directly go for stochastic rounding.
+    if (mantissas != NULL) {
+        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+        unsigned int threshold = random & 0xFFFFu;
+        SplitFloatResult split = split_float(param, threshold);
+        mantissas[idx] = split.bits;
+        params_memory[idx] = split.b_float;
+    } else {
+        // TODO this code path has two Get2dNoiseUint calls (one inside stochastic_rounding). Is that correct?
+        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+        stochastic_rounding(param, &params_memory[idx], random);
+    }
 }
 
 template<class T>
@@ -1934,7 +2022,9 @@ typedef struct {
     // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
+    // master_weight_mantissas is NULL unless fp32 weights is enabled.
+    // otherwise, it contains only the missing information to get back from bfloat16 to float
+    unsigned short* master_weight_mantissas;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
@@ -2026,7 +2116,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->grads_memory = NULL;
     model->m_memory = NULL;
     model->v_memory = NULL;
-    model->master_weights = NULL;
+    model->master_weight_mantissas = NULL;
     model->grads_acts_memory = NULL;
     model->inputs = NULL;
     model->targets = NULL;
@@ -2506,10 +2596,10 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
         if (model->use_master_weights == 1) {
-            printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
-            cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512>>>(model->master_weights, params_memory, num_parameters);
-            cudaCheck(cudaGetLastError());
+            // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
+            printf0("allocating %zu MiB for master weight mantissas\n", (model->num_parameters * sizeof(short)) >> 20);
+            cudaCheck(cudaMalloc((void**)&model->master_weight_mantissas, model->num_parameters * sizeof(short)));
+            cudaCheck(cudaMemset(model->master_weight_mantissas, 0, num_parameters * sizeof(short)));
         }
     }
 
@@ -2535,7 +2625,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
+    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weight_mantissas, grads_memory,
                                               model->m_memory, model->v_memory, num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                               grad_scale, seed);
@@ -2562,7 +2652,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_memory));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->master_weights));
+    cudaCheck(cudaFree(model->master_weight_mantissas));
     cudaCheck(cudaFree(model->acts_memory));
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
@@ -2824,6 +2914,7 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    model.use_master_weights = true;
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
