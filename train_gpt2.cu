@@ -38,6 +38,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdio.h>
 #include <stdarg.h>
 #include <string>
+#include <type_traits>
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -1246,7 +1247,11 @@ __global__ void adamw_kernel3(Tp* params_memory, unsigned short* mantissas, Tg* 
     // fetch the old value of this parameter as a float, from either source
     float old_param;
     if (mantissas != NULL) {
-        old_param = assemble_float(params_memory[idx], mantissas[idx]);
+        if constexpr (std::is_same_v<Tp, __nv_bfloat16>) {
+            old_param = assemble_float(params_memory[idx], mantissas[idx]);
+        } else {
+            assert(0 && "Master params are only implemented for bf16.");
+        }
     } else {
         old_param = (float)params_memory[idx];
     }
