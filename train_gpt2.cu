@@ -1266,9 +1266,7 @@ __global__ void adamw_kernel3(Tp* params_memory, unsigned short* mantissas, Tg* 
         mantissas[idx] = split.bits;
         params_memory[idx] = split.b_float;
     } else {
-        // TODO this code path has two Get2dNoiseUint calls (one inside stochastic_rounding). Is that correct?
-        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-        stochastic_rounding(param, &params_memory[idx], random);
+        stochastic_rounding(param, &params_memory[idx], seed);
     }
 }
 
