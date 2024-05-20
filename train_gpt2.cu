@@ -1265,11 +1265,15 @@ __global__ void adamw_kernel3(Tp* params_memory, unsigned short* mantissas, Tg* 
     // If we keep master parameter "copies", make sure to store the missing bits in the 'mantissas' array,
     // otherwise we can directly go for stochastic rounding.
     if (mantissas != NULL) {
-        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-        unsigned int threshold = random & 0xFFFFu;
-        SplitFloatResult split = split_float(param, threshold);
-        mantissas[idx] = split.bits;
-        params_memory[idx] = split.b_float;
+        if constexpr (std::is_same_v<Tp, __nv_bfloat16>) {
+            unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+            unsigned int threshold = random & 0xFFFFu;
+            SplitFloatResult split = split_float(param, threshold);
+            mantissas[idx] = split.bits;
+            params_memory[idx] = split.b_float;
+        } else {
+            assert(0 && "Master params are only implemented for bf16.");
+        }
     } else {
         stochastic_rounding(param, &params_memory[idx], seed);
     }
