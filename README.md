@@ -72,9 +72,11 @@ python dev/data/fineweb.py -s 100000000
 
 Where you will notice the use of glob pattern `*` to match all the train shards.
 
-## quick start (multiple GPUs)
+## quick start (multiple GPUs, multiple nodes)
 
 Great, let's get even more serious. We're using MPI and NCCL for multi-GPU training. Everything in the section above applies, with the following changes:
+
+Download and install [nccl](https://docs.nvidia.com/deeplearning/nccl/install-guide/index.html#down).
 
 ```bash
 # example to install MPI:
@@ -98,6 +100,25 @@ OMP_NUM_THREADS=8 ./train_gpt2
 ```
 
 The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference.
+
+For the slurm enabled GPU cluster use following sbatch script sample for the multinode training: 
+
+```
+#!/bin/bash
+#SBATCH --job-name=llmc-multinode
+#SBATCH --output=/dfs/llm.c/multinode/%x_%j_%t.log
+#SBATCH --ntasks=32                                 # total number of processes to launch 
+#SBATCH --ntasks-per-node=8                         # assuming each node has 8 gpus
+#SBATCH --gres=gpu:8                                # request 8 gpus from each node
+#SBATCH --nodelist=node[001-003]                    # list of the nodes to dispatch processes 
+
+export DFS_PATH="/dfs/llm.c/multinode"              # this path will be used to save nccl unique id and sync it between processes
+# export NCCL_SOCKET_IFNAME=ib0                     # network interface Ethernet or InifiniBand which enables gpu direct rdma
+# export NCCL_IB_HCA=mlx5_0,mlx5_1                  # list of all InfiniBand devices available
+cd /dfs/llm.c/
+
+srun ./train_gpt2cu -i ./data/TinyStories -e ./gpt2_1558M_bf16.bin -v 250 -s 250 -g 250 -o /dfs/llm.c/logs/train_stories_${SLURM_JOB_ID}.log -b 12 -x 200 -z 1
+```
 
 ## training: more detail
 
